@@ -25,7 +25,7 @@ from config import (API_ID, API_HASH, BOT_TOKEN, SESSION_NAME, ALLOWED_USERS,
 from fast_downloader import get_downloader, init_download_engine
 from fast_uploader import get_uploader
 from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
-                   offered_targets, estimate_size, render_preview, short_side)
+                   offered_targets, estimate_size, render_preview, short_side, guard_kbps)
 from settings_store import SettingsStore
 from transcoder import EncState, transcode
 from ui import (SpeedTracker, render_transfer, render_encode, human_size,
@@ -302,6 +302,12 @@ async def run_job(job: Job, height: int):
                     await live.set(render_encode(st, meta.name, height, preset, codec))
                     await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
 
+            # Audio: source එකේ bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy
+            ab = AUDIO_BITRATE.get(height, 96)
+            src_ab = meta.abitrate // 1000
+            ac = meta.acodec == "aac" and 0 < src_ab <= ab
+            if src_ab and not ac:
+                ab = min(ab, src_ab)
             ticker = asyncio.create_task(enc_ticker())
             try:
                 await transcode(
@@ -309,7 +315,8 @@ async def run_job(job: Job, height: int):
                     target=height, scale=short_side(meta) > height,
                     portrait=meta.height > meta.width,
                     preset=preset, codec=codec, crf=CRF[codec],
-                    abitrate=AUDIO_BITRATE.get(height, 96),
+                    abitrate=ab, audio_copy=ac,
+                    maxrate_kbps=guard_kbps(meta, height),
                 )
             finally:
                 ticker.cancel()
