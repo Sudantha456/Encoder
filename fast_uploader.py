@@ -19,7 +19,9 @@ from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartReq
 from telethon.errors import FloodWaitError
 from telethon.helpers import generate_random_long
 
+import config as _cfg
 from config import PROGRESS_UPDATE_INTERVAL
+from fast_conn import SenderPool
 
 logger = logging.getLogger("FastUL")
 
@@ -35,7 +37,8 @@ AUDIO_EXTS = {
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
 CHUNK_SIZE = 512 * 1024  
-MAX_CONCURRENT_UPLOADS = 4
+UL_CONNECTIONS = getattr(_cfg, "UL_CONNECTIONS", 6)
+UL_WORKERS_PER_CONN = getattr(_cfg, "UL_WORKERS_PER_CONN", 4)
 
 class FastUploader:
 
@@ -104,77 +107,84 @@ class FastUploader:
 
     async def _parallel_upload(self, client: TelegramClient, filepath: str, filename: str, file_size: int, upload_id: str, progress_cb: Callable):
         if file_size == 0:
-            return filepath 
+            return filepath
 
         file_id = generate_random_long()
-        is_big = file_size > 10 * 1024 * 1024 
+        is_big = file_size > 10 * 1024 * 1024
         total_parts = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-        
-        uploaded_bytes = 0
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
-        file_lock = asyncio.Lock()
 
-        async def upload_chunk(part_idx: int):
+        # Multi-connection pool (home DC). Fail වුණොත් main client එක විතරක්.
+        pool = SenderPool(client, None, UL_CONNECTIONS)
+        try:
+            await asyncio.wait_for(pool.start(), timeout=60.0)
+        except Exception as e:
+            logger.warning(f"Pool start failed ({e!r}) — single connection")
+            await pool.close()
+            pool = SenderPool(client, None, 1)
+            await pool.start()
+
+        uploaded_bytes = 0
+        queue: asyncio.Queue = asyncio.Queue()
+        for i in range(total_parts):
+            queue.put_nowait(i)
+
+        async def worker(w: int):
             nonlocal uploaded_bytes
-            
-            async with semaphore:
-                if self.is_cancelled(upload_id):
-                    raise asyncio.CancelledError("Upload cancelled")
-                    
-                async with file_lock:
-                    with open(filepath, 'rb') as f:
-                        f.seek(part_idx * CHUNK_SIZE)
-                        chunk_data = f.read(CHUNK_SIZE)
-                        
-                for attempt in range(5):
+            with open(filepath, "rb") as f:
+                while True:
                     if self.is_cancelled(upload_id):
                         raise asyncio.CancelledError("Upload cancelled")
                     try:
-                        if is_big:
-                            req = SaveBigFilePartRequest(
-                                file_id=file_id,
-                                file_part=part_idx,
-                                file_total_parts=total_parts,
-                                bytes=chunk_data
-                            )
-                        else:
-                            req = SaveFilePartRequest(
-                                file_id=file_id,
-                                file_part=part_idx,
-                                bytes=chunk_data
-                            )
-                        
-                        # Network හිරවීම වළක්වන Timeout එක
-                        await asyncio.wait_for(client(req), timeout=30.0)
-                        
-                        uploaded_bytes += len(chunk_data)
-                        progress_cb(min(uploaded_bytes, file_size), file_size)
+                        part_idx = queue.get_nowait()
+                    except asyncio.QueueEmpty:
                         return
-                        
-                    except asyncio.CancelledError:
-                        raise
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Chunk Upload Timed out at part {part_idx} (Attempt {attempt+1}). Retrying...")
-                        if attempt == 4:
-                            raise RuntimeError(f"Chunk {part_idx} upload failed after 5 timeouts")
-                        await asyncio.sleep(2 ** attempt)
-                    except FloodWaitError as e:
-                        logger.warning(f"Upload chunk FloodWait ({e.seconds}s)")
-                        await asyncio.sleep(e.seconds + 1)
-                    except Exception as e:
-                        if attempt == 4:
-                            logger.error(f"Failed to upload chunk {part_idx}: {e}")
-                            raise e
-                        await asyncio.sleep(2 ** attempt)
+                    f.seek(part_idx * CHUNK_SIZE)
+                    chunk_data = f.read(CHUNK_SIZE)
 
-        tasks = [asyncio.create_task(upload_chunk(i)) for i in range(total_parts)]
-        if tasks:
+                    for attempt in range(6):
+                        if self.is_cancelled(upload_id):
+                            raise asyncio.CancelledError("Upload cancelled")
+                        try:
+                            if is_big:
+                                req = SaveBigFilePartRequest(file_id=file_id, file_part=part_idx,
+                                                             file_total_parts=total_parts, bytes=chunk_data)
+                            else:
+                                req = SaveFilePartRequest(file_id=file_id, file_part=part_idx, bytes=chunk_data)
+                            await asyncio.wait_for(pool.send(req, w + attempt), timeout=40.0)
+                            uploaded_bytes += len(chunk_data)
+                            progress_cb(min(uploaded_bytes, file_size), file_size)
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except FloodWaitError as e:
+                            logger.warning(f"Upload FloodWait ({e.seconds}s)")
+                            await asyncio.sleep(e.seconds + 1)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Part {part_idx} timed out (attempt {attempt+1})")
+                            if attempt == 5:
+                                raise RuntimeError(f"Part {part_idx} failed after 6 timeouts")
+                            await asyncio.sleep(min(2 ** attempt, 8))
+                        except Exception as e:
+                            if attempt == 5:
+                                logger.error(f"Failed to upload part {part_idx}: {e}")
+                                raise
+                            await asyncio.sleep(min(2 ** attempt, 8))
+
+        n_workers = min(len(pool.senders) * UL_WORKERS_PER_CONN, total_parts)
+        tasks = [asyncio.create_task(worker(i)) for i in range(n_workers)]
+        try:
             await asyncio.gather(*tasks)
-            
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            await pool.close()
+
         if is_big:
             return InputFileBig(id=file_id, parts=total_parts, name=filename)
-        else:
-            return InputFile(id=file_id, parts=total_parts, name=filename, md5_checksum="")
+        return InputFile(id=file_id, parts=total_parts, name=filename, md5_checksum="")
 
     async def upload_file(
         self,
