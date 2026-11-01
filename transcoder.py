@@ -49,7 +49,7 @@ class EncState:
         return int(self.out_size / self.percent * 100) if self.percent >= 3 else 0
 
 
-def build_cmd(src, dst, *, target, scale, portrait, preset, codec, crf, abitrate):
+def build_cmd(src, dst, *, target, scale, portrait, preset, codec, crf, abitrate, maxrate_kbps=0, audio_copy=False):
     vf = []
     if scale:
         vf.append(f"scale={target}:-2" if portrait else f"scale=-2:{target}")
@@ -60,10 +60,12 @@ def build_cmd(src, dst, *, target, scale, portrait, preset, codec, crf, abitrate
         "-vf", ",".join(vf),
         "-c:v", codec, "-preset", preset, "-crf", str(crf),
     ]
+    if maxrate_kbps:
+        cmd += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
     if codec == "libx265":
         cmd += ["-tag:v", "hvc1", "-x265-params", "log-level=error"]
+    cmd += (["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", f"{abitrate}k"])
     cmd += [
-        "-c:a", "aac", "-b:a", f"{abitrate}k",
         "-max_muxing_queue_size", "1024", "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats", dst,
     ]
