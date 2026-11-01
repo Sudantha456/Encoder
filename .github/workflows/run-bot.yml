@@ -1,0 +1,49 @@
+name: Run Encoder Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+# එකවර bot instance දෙකක් run වෙන එක වළක්වනවා (එකම token එකට conflict වෙනවා)
+concurrency:
+  group: encoder-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -hide_banner -encoders | grep -E "libx264|libx265"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Telegram Bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
+          MAX_PARALLEL_JOBS: ${{ vars.MAX_PARALLEL_JOBS || '2' }}
+          DOWNLOAD_DIR: ${{ runner.temp }}/downloads
+        run: |
+          python3 -u bot.py
