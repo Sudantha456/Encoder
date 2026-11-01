@@ -1,8 +1,9 @@
 """
-fast_downloader.py — Telethon SMART PARALLEL downloader
+fast_downloader.py — Telethon MULTI-CONNECTION parallel downloader
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Premium Rate Limits මගහැරීමට Global Flood Lock සහ 
-වේගය යළි පිහිටුවන (Speed Auto-Recovery) බුද්ධිමත් වේග පාලකයක් ඇතුළත් කර ඇත.
+• Connections කිහිපයක් (DL_CONNECTIONS) × හැම එකකම parallel requests (DL_WORKERS_PER_CONN)
+• 1MB chunks, file descriptor එක එක පාරක් open (pwrite)
+• FloodWait → හැම worker එකම pause; fail වුණොත් native download එකට fallback
 """
 import os
 import time
@@ -15,14 +16,19 @@ from typing import Optional, Callable, Dict
 from telethon import TelegramClient
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import InputDocumentFileLocation
-from telethon.errors import FloodWaitError, FileMigrateError
+from telethon.errors import FloodWaitError
 
+import config as _cfg
 from config import PROGRESS_UPDATE_INTERVAL
+from fast_conn import SenderPool
 
 logger = logging.getLogger("FastDL")
 
-CHUNK_SIZE = 512 * 1024 
-MAX_CONCURRENT_CHUNKS = 1  
+CHUNK_SIZE = 1024 * 1024                                   # 1MB (Telegram max)
+DL_CONNECTIONS = getattr(_cfg, "DL_CONNECTIONS", 6)
+DL_WORKERS_PER_CONN = getattr(_cfg, "DL_WORKERS_PER_CONN", 4)
+SMALL_FILE = 4 * 1024 * 1024                               # මීට කුඩා නම් native
+
 
 class FastDownloader:
 
@@ -64,168 +70,130 @@ class FastDownloader:
         save_path: str,
         download_id: str,
         progress_callback: Optional[Callable] = None,
-        max_retries: int = 15,
+        max_retries: int = 10,
     ) -> str:
-        
         self._cancel_flags[download_id] = False
 
-        doc_size = getattr(message.document, 'size', 0) if getattr(message, 'document', None) else 0
-        
-        # 5MB සීමාව 1MB දක්වා අඩු කර ඇත. දැන් 1MB ට වැඩි සියලුම files වේගවත් Parallel ක්‍රමයට යයි!
-        if getattr(message, 'photo', None) or (doc_size > 0 and doc_size < 1 * 1024 * 1024):
+        doc = getattr(message, 'document', None)
+        doc_size = getattr(doc, 'size', 0) if doc else 0
+        if getattr(message, 'photo', None) or doc_size < SMALL_FILE:
             return await self._download_native(client, message, save_path, download_id, progress_callback, max_retries)
 
         location, total_size = self._get_file_location(message)
-
         if not location or total_size == 0:
             return await self._download_native(client, message, save_path, download_id, progress_callback, max_retries)
 
-        last_update = [0.0]
-        downloaded_bytes = 0
-
-        def _prog(current_add: int):
-            nonlocal downloaded_bytes
-            downloaded_bytes += current_add
-            if self.is_cancelled(download_id):
-                raise asyncio.CancelledError("Cancelled")
-            
-            now = time.monotonic()
-            if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded_bytes >= total_size:
-                last_update[0] = now
-                if progress_callback:
-                    asyncio.create_task(progress_callback(downloaded_bytes, total_size))
-
-        with open(save_path, "wb") as f:
-            pass 
-
-        file_lock = asyncio.Lock()
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
-        
-        # ── Smart Flood Protection Variables ──
-        global_flood_lock = asyncio.Lock()
-        dynamic_pacing = [0.0]
-
-        correct_dc = None
-        first_chunk_data = None
-        
         try:
-            req = GetFileRequest(location=location, offset=0, limit=CHUNK_SIZE)
-            first_chunk = await asyncio.wait_for(client(req), timeout=45.0)
-            first_chunk_data = first_chunk.bytes
-        except FileMigrateError as e:
-            correct_dc = e.new_dc
-        except Exception:
-            return await self._download_native(client, message, save_path, download_id, progress_callback, max_retries)
-
-        sender = None
-        if correct_dc:
-            try:
-                sender = await asyncio.wait_for(client._borrow_exported_sender(correct_dc), timeout=45.0)
-            except Exception:
-                return await self._download_native(client, message, save_path, download_id, progress_callback, max_retries)
-
-        async def fetch_chunk(offset: int):
-            for attempt in range(max_retries):
-                if self.is_cancelled(download_id):
-                    raise asyncio.CancelledError("Cancelled")
-                
-                # Apply Dynamic Pacing
-                if dynamic_pacing[0] > 0:
-                    await asyncio.sleep(dynamic_pacing[0])
-
-                if global_flood_lock.locked():
-                    async with global_flood_lock:
-                        pass
-                    await asyncio.sleep(random.uniform(0.1, 0.4))
-
-                try:
-                    async with semaphore:
-                        req = GetFileRequest(location=location, offset=offset, limit=CHUNK_SIZE)
-                        # Timeout එක 60s දක්වා වැඩි කර ඇත
-                        if sender:
-                            result = await asyncio.wait_for(sender.send(req), timeout=60.0)
-                        else:
-                            result = await asyncio.wait_for(client(req), timeout=60.0)
-                    
-                    if not result.bytes:
-                        return 
-                        
-                    async with file_lock:
-                        with open(save_path, "r+b") as f:
-                            f.seek(offset)
-                            f.write(result.bytes)
-                    
-                    _prog(len(result.bytes))
-                    
-                    # Auto-Recovery: සාර්ථක නම් Speed එක ආයෙත් ටිකෙන් ටික වැඩි කරයි
-                    if dynamic_pacing[0] > 0:
-                        dynamic_pacing[0] = max(0.0, dynamic_pacing[0] - 0.02)
-
-                    return
-
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    if attempt == max_retries - 1:
-                        raise RuntimeError(f"Chunk at {offset} failed after timeouts")
-                    await asyncio.sleep(2 ** attempt)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    is_flood = isinstance(e, FloodWaitError) or "premium" in err_str or "wait of" in err_str
-                    
-                    if is_flood:
-                        wait_secs = 12
-                        if isinstance(e, FloodWaitError):
-                            wait_secs = e.seconds
-                        else:
-                            m = re.search(r'wait of (\d+)', err_str)
-                            if m: wait_secs = int(m.group(1))
-                        
-                        if not global_flood_lock.locked():
-                            async with global_flood_lock:
-                                total_wait = wait_secs + random.uniform(1.0, 2.5)
-                                logger.warning(f"Rate Limit Hit! Pausing all chunks for {total_wait:.1f}s...")
-                                await asyncio.sleep(total_wait)
-                                # වේගය අඩු කරයි (උපරිම 2.0s)
-                                dynamic_pacing[0] = min(2.0, dynamic_pacing[0] + 0.15)
-                        else:
-                            await asyncio.sleep(1)
-                        continue
-
-                    if attempt == max_retries - 1:
-                        raise e
-                    await asyncio.sleep(2 ** attempt)
-
-        try:
-            tasks = []
-            start_offset = 0
-            
-            if first_chunk_data is not None:
-                async with file_lock:
-                    with open(save_path, "r+b") as f:
-                        f.seek(0)
-                        f.write(first_chunk_data)
-                _prog(len(first_chunk_data))
-                start_offset = CHUNK_SIZE
-
-            if start_offset < total_size:
-                for offset in range(start_offset, total_size, CHUNK_SIZE):
-                    tasks.append(asyncio.create_task(fetch_chunk(offset)))
-
-                if tasks:
-                    await asyncio.gather(*tasks)
-            
-            return save_path
-            
+            return await self._download_parallel(client, doc, location, total_size, save_path,
+                                                 download_id, progress_callback, max_retries)
         except asyncio.CancelledError:
             self.force_delete_file(save_path)
             raise
         except Exception as e:
+            if self.is_cancelled(download_id):
+                self.force_delete_file(save_path)
+                raise asyncio.CancelledError("Cancelled")
+            logger.warning(f"Parallel download failed ({e!r}) — native fallback")
             self.force_delete_file(save_path)
-            raise RuntimeError(f"Download failed: {e}")
+            return await self._download_native(client, message, save_path, download_id, progress_callback, max_retries)
+
+    async def _download_parallel(self, client, doc, location, total_size, save_path,
+                                download_id, progress_callback, max_retries) -> str:
+        pool = SenderPool(client, getattr(doc, 'dc_id', None), DL_CONNECTIONS)
+        await asyncio.wait_for(pool.start(), timeout=60.0)
+
+        flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+        fd = os.open(save_path, flags)
+        os.ftruncate(fd, total_size)
+        has_pwrite = hasattr(os, "pwrite")
+        write_lock = asyncio.Lock()
+
+        downloaded = 0
+        last_update = [0.0]
+        flood_until = [0.0]
+
+        def _prog(n: int):
+            nonlocal downloaded
+            downloaded += n
+            now = time.monotonic()
+            if now - last_update[0] >= PROGRESS_UPDATE_INTERVAL or downloaded >= total_size:
+                last_update[0] = now
+                if progress_callback:
+                    asyncio.create_task(progress_callback(downloaded, total_size))
+
+        async def write_at(off: int, data: bytes):
+            if has_pwrite:
+                os.pwrite(fd, data, off)
+            else:
+                async with write_lock:
+                    os.lseek(fd, off, os.SEEK_SET)
+                    os.write(fd, data)
+
+        async def fetch(off: int, worker_idx: int):
+            for attempt in range(max_retries):
+                if self.is_cancelled(download_id):
+                    raise asyncio.CancelledError("Cancelled")
+                wait = flood_until[0] - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait + random.uniform(0.0, 0.5))
+                try:
+                    req = GetFileRequest(location=location, offset=off, limit=CHUNK_SIZE)
+                    # retry වෙනකොට වෙන connection එකකට මාරු වෙනවා
+                    res = await asyncio.wait_for(pool.send(req, worker_idx + attempt), timeout=60.0)
+                    data = getattr(res, "bytes", None)
+                    if data is None:
+                        raise RuntimeError(f"Unexpected response: {type(res).__name__}")
+                    await write_at(off, data)
+                    _prog(len(data))
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except FloodWaitError as e:
+                    flood_until[0] = max(flood_until[0], time.monotonic() + e.seconds + 1)
+                    logger.warning(f"FloodWait {e.seconds}s — all workers paused")
+                except asyncio.TimeoutError:
+                    if attempt == max_retries - 1:
+                        raise RuntimeError(f"Chunk {off} timed out {max_retries}×")
+                    await asyncio.sleep(min(2 ** attempt, 8))
+                except Exception as e:
+                    err = str(e).lower()
+                    if "wait of" in err or "premium" in err:
+                        m = re.search(r'wait of (\d+)', err)
+                        flood_until[0] = max(flood_until[0], time.monotonic() + (int(m.group(1)) if m else 12) + 1)
+                        continue
+                    if attempt == max_retries - 1:
+                        raise
+                    await asyncio.sleep(min(2 ** attempt, 8))
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for off in range(0, total_size, CHUNK_SIZE):
+            queue.put_nowait(off)
+
+        async def worker(idx: int):
+            while True:
+                if self.is_cancelled(download_id):
+                    raise asyncio.CancelledError("Cancelled")
+                try:
+                    off = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                await fetch(off, idx)
+
+        n_workers = min(len(pool.senders) * DL_WORKERS_PER_CONN, queue.qsize())
+        tasks = [asyncio.create_task(worker(i)) for i in range(n_workers)]
+        try:
+            await asyncio.gather(*tasks)
+            if downloaded < total_size:
+                raise RuntimeError(f"Incomplete download {downloaded}/{total_size}")
+            return save_path
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         finally:
-            if sender:
-                await client._return_exported_sender(sender)
+            os.close(fd)
+            await pool.close()
 
     async def _download_native(self, client, message, save_path, download_id, progress_callback, max_retries=10):
         last_update = [0.0]
@@ -255,23 +223,25 @@ class FastDownloader:
                 err_str = str(e).lower()
                 if isinstance(e, FloodWaitError) or "premium" in err_str or "wait of" in err_str:
                     wait_secs = 15
-                    if isinstance(e, FloodWaitError): wait_secs = e.seconds
+                    if isinstance(e, FloodWaitError):
+                        wait_secs = e.seconds
                     else:
                         m = re.search(r'wait of (\d+)', err_str)
-                        if m: wait_secs = int(m.group(1))
-                    
+                        if m:
+                            wait_secs = int(m.group(1))
                     wait_time = wait_secs + random.uniform(1.0, 3.0)
                     logger.warning(f"Native Rate Limit. Waiting {wait_time:.1f}s")
                     await asyncio.sleep(wait_time)
                     continue
-
                 if attempt >= max_retries - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
 
         raise RuntimeError(f"Native Download failed after {max_retries} attempts")
 
+
 _downloader: Optional[FastDownloader] = None
+
 
 def get_downloader() -> FastDownloader:
     global _downloader
@@ -279,10 +249,12 @@ def get_downloader() -> FastDownloader:
         _downloader = FastDownloader()
     return _downloader
 
+
 async def init_download_engine() -> FastDownloader:
     dl = get_downloader()
-    logger.info("FastDownloader (Smart Auto-Pacing & Recovery Edition) initialized!")
+    logger.info(f"FastDownloader (multi-connection ×{DL_CONNECTIONS}) initialized!")
     return dl
+
 
 async def close_download_engine():
     global _downloader
