@@ -9,7 +9,8 @@ from typing import Optional
 
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 
-from config import RESOLUTIONS, AUDIO_BITRATE, PROBE_HEAD_CHUNKS, PROBE_TAIL_CHUNKS
+from config import (RESOLUTIONS, AUDIO_BITRATE, PROBE_HEAD_CHUNKS, PROBE_TAIL_CHUNKS,
+                    SIZE_GUARD, SIZE_GUARD_RATIO, MIN_GUARD_KBPS)
 from ui import human_size, human_size_short, human_time, esc
 
 logger = logging.getLogger("Media")
@@ -217,6 +218,19 @@ def target_dims(m: VideoMeta, t: int):
     return int(round(w * r / 2) * 2), int(round(h * r / 2) * 2)
 
 
+def guard_kbps(m: VideoMeta, t: int) -> int:
+    """Source video bitrate (resolution අනුව scale කරපු) — 0 නම් guard නෑ."""
+    if not SIZE_GUARD:
+        return 0
+    dur = m.duration
+    src_v = m.vbitrate or (max(m.size * 8 / dur - (m.abitrate or 128_000), 0) if dur > 0 else 0)
+    if src_v <= 0 or not m.width:
+        return 0
+    tw, th = target_dims(m, t)
+    ratio = (tw * th) / max(m.width * m.height, 1)
+    return max(int(src_v * (ratio ** 0.75) * SIZE_GUARD_RATIO / 1000), MIN_GUARD_KBPS)
+
+
 def estimate_size(m: VideoMeta, t: int, preset: str, codec: str) -> int:
     dur = m.duration
     if dur <= 0 or not m.width:
@@ -226,10 +240,9 @@ def estimate_size(m: VideoMeta, t: int, preset: str, codec: str) -> int:
     bpp = BASE_BPP * RES_BPP.get(t, 1.0) * PRESET_FACTOR.get(preset, 1.0) * CODEC_FACTOR.get(codec, 1.0)
     vbps = tw * th * fps * bpp
 
-    src_v = m.vbitrate or max(m.size * 8 / dur - (m.abitrate or 128_000), 0)
-    if src_v > 0:
-        ratio = (tw * th) / max(m.width * m.height, 1)
-        vbps = min(vbps, src_v * (ratio ** 0.75) * 1.15)
+    g = guard_kbps(m, t)
+    if g:
+        vbps = min(vbps, g * 1000)
 
     abps = AUDIO_BITRATE.get(t, 96) * 1000
     if m.probed and not m.acodec:
