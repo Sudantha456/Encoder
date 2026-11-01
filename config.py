@@ -5,7 +5,7 @@ fast_downloader.py / fast_uploader.py දෙකත් මේ PROGRESS_UPDATE_INT
 import os
 
 # ── Telegram ──────────────────────────────────────────────
-API_ID = int(os.getenv("API_ID", ""))
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "encoder_bot")
@@ -49,6 +49,12 @@ AUDIO_BITRATE = {720: 128, 480: 96, 240: 64}   # kbps
 SIZE_GUARD = os.getenv("SIZE_GUARD", "1") == "1"
 SIZE_GUARD_RATIO = float(os.getenv("SIZE_GUARD_RATIO", "0.7"))   # 0.7 = source bitrate එකෙන් 70% (≈30% කුඩා). අඩු කළොත් තවත් කුඩා
 MIN_GUARD_KBPS = 120
+
+# ── 🚀 Speed: connections × workers (වැඩි = වේගවත්, නමුත් FloodWait වැඩි වෙන්න පුළුවන්) ──
+DL_CONNECTIONS = int(os.getenv("DL_CONNECTIONS", "6"))
+DL_WORKERS_PER_CONN = int(os.getenv("DL_WORKERS_PER_CONN", "4"))
+UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "6"))
+UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "4"))
 
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "2"))
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024    # bot upload limit ≈ 2GB
