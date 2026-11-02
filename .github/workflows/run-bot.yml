@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '0 */6 * * *'
 
+permissions:
+  contents: write   # temp Releases (distributed encode)
+  actions: write    # workers dispatch කරන්න
+
 # එකවර bot instance දෙකක් run වෙන එක වළක්වනවා (එකම token එකට conflict වෙනවා)
 concurrency:
   group: encoder-bot
@@ -44,6 +48,42 @@ jobs:
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           PROGRESS_UPDATE_INTERVAL: ${{ vars.PROGRESS_UPDATE_INTERVAL || '3' }}
           MAX_PARALLEL_JOBS: ${{ vars.MAX_PARALLEL_JOBS || '2' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DIST_WORKERS: ${{ vars.DIST_WORKERS || '4' }}
+          DIST_BACKEND: persistent
           DOWNLOAD_DIR: ${{ runner.temp }}/downloads
         run: |
           python3 -u bot.py
+
+  # ── Background workers: main bot එක්කම පටන් අරන් job එන තුරු idle ──
+  # (DIST_WORKERS වෙනස් කරන්නේ නම් මේ matrix එකත් ඒ ගාණටම වෙනස් කරන්න)
+  workers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Worker ${{ matrix.part }} (idle → encode on demand)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PART: ${{ matrix.part }}
+          WORKER_MODE: serve
+        run: python3 -u worker.py
