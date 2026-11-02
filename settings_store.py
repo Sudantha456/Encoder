@@ -25,6 +25,7 @@ class SettingsStore:
         return {
             "preset": preset if preset in PRESETS else DEFAULT_PRESET,
             "codec": codec if codec in CODECS else DEFAULT_CODEC,
+            "dist": s.get("dist", "auto") if s.get("dist", "auto") in ("auto", "on", "off") else "auto",
         }
 
     def set(self, user_id: int, **kwargs):
