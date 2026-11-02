@@ -49,26 +49,33 @@ class EncState:
         return int(self.out_size / self.percent * 100) if self.percent >= 3 else 0
 
 
-def build_cmd(src, dst, *, target, scale, portrait, preset, codec, crf, abitrate, maxrate_kbps=0, audio_copy=False):
+def build_cmd(src, dst, *, target, scale, portrait, preset, codec, crf, abitrate=0,
+              maxrate_kbps=0, audio_mode="aac", container="mp4"):
+    """audio_mode: aac | copy | none     container: mp4 | mkv"""
     vf = []
     if scale:
         vf.append(f"scale={target}:-2" if portrait else f"scale=-2:{target}")
     vf.append("format=yuv420p")
-    cmd = [
-        "ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", src,
-        "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
-        "-vf", ",".join(vf),
-        "-c:v", codec, "-preset", preset, "-crf", str(crf),
-    ]
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", src, "-map", "0:v:0"]
+    if audio_mode != "none":
+        cmd += ["-map", "0:a?"]
+    cmd += ["-sn", "-dn", "-vf", ",".join(vf), "-c:v", codec, "-preset", preset, "-crf", str(crf)]
     if maxrate_kbps:
         cmd += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
     if codec == "libx265":
-        cmd += ["-tag:v", "hvc1", "-x265-params", "log-level=error"]
-    cmd += (["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", f"{abitrate}k"])
-    cmd += [
-        "-max_muxing_queue_size", "1024", "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats", dst,
-    ]
+        cmd += ["-x265-params", "log-level=error"]
+        if container == "mp4":
+            cmd += ["-tag:v", "hvc1"]
+    if audio_mode == "none":
+        cmd += ["-an"]
+    elif audio_mode == "copy":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", f"{abitrate}k"]
+    cmd += ["-max_muxing_queue_size", "1024"]
+    if container == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += ["-progress", "pipe:1", "-nostats", dst]
     return cmd
 
 
