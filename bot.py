@@ -28,8 +28,9 @@ from media import (VideoMeta, telegram_meta, probe_remote, ffprobe, apply_probe,
                    offered_targets, estimate_size, render_preview, short_side, guard_kbps)
 from settings_store import SettingsStore
 from transcoder import EncState, transcode
+import dist
 from ui import (SpeedTracker, render_transfer, render_encode, human_size,
-                human_size_short, human_time, human_speed, esc)
+                human_size_short, human_time, human_speed, esc, render_dist)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("EncoderBot")
@@ -120,6 +121,8 @@ def settings_text(uid: int) -> str:
         f"🎚 Preset: <b>{s['preset']}</b>",
         f"   <i>{PRESET_INFO[s['preset']]}</i>",
         f"🎞 Codec: <b>{s['codec']}</b>",
+        f"🌐 Distributed (GitHub workers): <b>{s['dist']}</b>"
+        + ("" if dist.available() else "  <i>(මේ environment එකේ නෑ)</i>"),
         "━━━━━━━━━━━━━━━━━━━━",
         "ultrafast → වේගවත්ම  |  veryslow → අඩුම size",
         "H.265 → size අඩුයි, encode වෙන්න වැඩි වෙලාවක් යනවා",
@@ -136,6 +139,8 @@ def settings_buttons(uid: int, job_id: str):
             row = []
     rows.append([Button.inline(("✅ " if c == s["codec"] else "") + n, cb("cod", job_id, c))
                  for c, n in CODECS.items()])
+    rows.append([Button.inline(("✅ " if s["dist"] == m else "") + f"🌐 {m.title()}", cb("dst", job_id, m))
+                 for m in ("auto", "on", "off")])
     rows.append([Button.inline("🔙 Back" if job_id != "0" else "✖ Close", cb("back", job_id))])
     return rows
 
@@ -230,8 +235,9 @@ async def on_callback(event):
         await event.answer()
         await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
 
-    elif action in ("pre", "cod"):
-        store.set(uid, **({"preset": arg} if action == "pre" else {"codec": arg}))
+    elif action in ("pre", "cod", "dst"):
+        key = {"pre": "preset", "cod": "codec", "dst": "dist"}[action]
+        store.set(uid, **{key: arg})
         await event.answer(f"{arg} ✔")
         with contextlib.suppress(MessageNotModifiedError):
             await event.edit(settings_text(uid), buttons=settings_buttons(uid, job_id))
@@ -295,34 +301,73 @@ async def run_job(job: Job, height: int):
 
             # 3) ENCODE ───────────────────────────────
             phase[0] = "enc"
-            st = EncState(duration=meta.duration, src_fps=meta.fps)
-
-            async def enc_ticker():
-                while True:
-                    await live.set(render_encode(st, meta.name, height, preset, codec))
-                    await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-
             # Audio: source එකේ bitrate එකට වඩා වැඩි කරන්නේ නෑ; AAC & අඩු නම් copy
             ab = AUDIO_BITRATE.get(height, 96)
             src_ab = meta.abitrate // 1000
             ac = meta.acodec == "aac" and 0 < src_ab <= ab
             if src_ab and not ac:
                 ab = min(ab, src_ab)
-            ticker = asyncio.create_task(enc_ticker())
-            try:
-                await transcode(
-                    str(src), str(dst), st, job,
-                    target=height, scale=short_side(meta) > height,
-                    portrait=meta.height > meta.width,
-                    preset=preset, codec=codec, crf=CRF[codec],
-                    abitrate=ab, audio_copy=ac,
-                    maxrate_kbps=guard_kbps(meta, height),
-                )
-            finally:
-                ticker.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await ticker
-            stats["enc_time"], stats["enc_speed"] = st.elapsed, st.avg_speed
+            enc_opts = dict(
+                target=height, scale=short_side(meta) > height, portrait=meta.height > meta.width,
+                preset=preset, codec=codec, crf=CRF[codec], maxrate_kbps=guard_kbps(meta, height),
+                abitrate=ab, audio_mode="copy" if ac else "aac",
+            )
+            encoded = False
+
+            # 3a) Distributed (GitHub Actions workers) ─
+            if dist.should_distribute(meta, height, preset, codec, cfg["dist"]):
+                dst_state = dist.DistState(meta.duration, meta.fps, config.DIST_WORKERS)
+
+                async def dist_ticker():
+                    while True:
+                        await live.set(render_dist(dst_state, meta.name, height, preset, codec))
+                        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+
+                dticker = asyncio.create_task(dist_ticker())
+                try:
+                    run = dist.DistRun(client=client, job=job, src=src, dst=dst, meta=meta,
+                                       state=dst_state, opts=enc_opts, workdir=workdir)
+                    dstats = await run.run()
+                    stats["enc_time"], stats["enc_speed"] = dst_state.elapsed, meta.duration / max(dst_state.elapsed, 1)
+                    stats["workers"] = dstats["workers"]
+                    stats["local_parts"] = dstats["local_parts"]
+                    encoded = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Distributed encode failed → local: {e!r}")
+                    await live.set(f"⚠️ Distributed failed ({esc(str(e)[:120])})\nmain runner එකෙන්ම encode කරනවා…", force=True)
+                    for pat in ("raw_part_*", "encoded_part_*", "audio.mka", "concat.txt"):
+                        for f in workdir.glob(pat):
+                            f.unlink(missing_ok=True)
+                    dst.unlink(missing_ok=True)
+                finally:
+                    dticker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await dticker
+
+            # 3b) Single runner ───────────────────────
+            if not encoded:
+                st = EncState(duration=meta.duration, src_fps=meta.fps)
+
+                async def enc_ticker():
+                    while True:
+                        await live.set(render_encode(st, meta.name, height, preset, codec))
+                        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+
+                ticker = asyncio.create_task(enc_ticker())
+                try:
+                    await transcode(
+                        str(src), str(dst), st, job,
+                        target=height, scale=enc_opts["scale"], portrait=enc_opts["portrait"],
+                        preset=preset, codec=codec, crf=CRF[codec], abitrate=ab,
+                        maxrate_kbps=enc_opts["maxrate_kbps"], audio_mode=enc_opts["audio_mode"],
+                    )
+                finally:
+                    ticker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await ticker
+                stats["enc_time"], stats["enc_speed"] = st.elapsed, st.avg_speed
             with contextlib.suppress(OSError):
                 os.remove(src)
 
@@ -361,7 +406,9 @@ async def run_job(job: Job, height: int):
                 f"({'−' if saved >= 0 else '+'}{abs(saved):.0f}%)"
                 + (f"  •  est ≈{human_size(est_size)}" if est_size else ""),
                 f"📥 DL: <code>{human_speed(stats['dl_avg'])}</code> • <code>{human_time(stats['dl_time'])}</code>",
-                f"🎬 Encode: <code>{stats['enc_speed']:.2f}x</code> • <code>{human_time(stats['enc_time'])}</code>",
+                f"🎬 Encode{' 🌐×' + str(stats['workers']) if 'workers' in stats else ''}: "
+                f"<code>{stats['enc_speed']:.2f}x</code> • <code>{human_time(stats['enc_time'])}</code>"
+                + (f"  (🏠 local parts: {stats['local_parts']})" if stats.get("local_parts") else ""),
                 f"📤 UL: <code>{human_speed(stats['ul_avg'])}</code> • <code>{human_time(stats['ul_time'])}</code>",
                 f"⏱ Total: <code>{human_time(time.monotonic() - t_start)}</code>",
             ]), force=True)
@@ -388,6 +435,9 @@ async def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     await client.start(bot_token=BOT_TOKEN)
     await init_download_engine()
+    if dist.available() and config.DIST_BACKEND == "persistent":
+        asyncio.create_task(dist.heartbeat_loop())
+        logger.info("🌐 Persistent workers mode — heartbeat started")
     me = await client.get_me()
     logger.info(f"✅ @{me.username} running • update interval {PROGRESS_UPDATE_INTERVAL}s")
     await client.run_until_disconnected()
