@@ -1,0 +1,53 @@
+name: Encode Worker
+
+# Main bot (run-bot.yml) මේක workflow_dispatch කරනවා. අතින් run කරන්න එපා.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job id'
+        required: true
+      config:
+        description: 'Job config (JSON)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          N=$(python3 -c "import json,os;print(json.loads(os.environ['CONFIG'])['n'])")
+          echo "matrix={\"part\":$(python3 -c "print(list(range($N)))")}" >> "$GITHUB_OUTPUT"
+
+  encode:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Encode part ${{ matrix.part }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CONFIG: ${{ inputs.config }}
+          PART: ${{ matrix.part }}
+        run: python3 -u worker.py
