@@ -56,6 +56,17 @@ DL_WORKERS_PER_CONN = int(os.getenv("DL_WORKERS_PER_CONN", "4"))
 UL_CONNECTIONS = int(os.getenv("UL_CONNECTIONS", "6"))
 UL_WORKERS_PER_CONN = int(os.getenv("UL_WORKERS_PER_CONN", "4"))
 
+# ── 🌐 Distributed encoding (GitHub Actions workers) ──
+DIST_WORKERS = int(os.getenv("DIST_WORKERS", "4"))                 # කොටස් / workers ගණන
+DIST_WORKFLOW = os.getenv("DIST_WORKFLOW", "encode-worker.yml")
+DIST_AUTO_MIN_SECONDS = int(os.getenv("DIST_AUTO_MIN_SECONDS", "240"))  # auto mode: single-runner encode මීට වැඩි නම් විතරයි
+# "persistent" = workers main එක්කම background එකේ idle (run-bot.yml හි workers job)
+# "dispatch"   = job එකකට workers workflow_dispatch කරනවා (encode-worker.yml)
+DIST_BACKEND = os.getenv("DIST_BACKEND", "dispatch")
+DIST_START_TIMEOUT = int(os.getenv("DIST_START_TIMEOUT", "45" if DIST_BACKEND == "persistent" else "240"))  # worker එකක් start නොවුණොත් main එකම encode කරනවා
+DIST_STALE_SECONDS = int(os.getenv("DIST_STALE_SECONDS", "180"))   # progress නොවෙනස් වුණොත් fallback
+DIST_PROGRESS_CHAT = os.getenv("DIST_PROGRESS_CHAT", "")           # හිස් = user ගේ chat එකම (messages පස්සේ delete වෙනවා)
+
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "2"))
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024    # bot upload limit ≈ 2GB
 
