@@ -115,3 +115,42 @@ def render_encode(st, name: str, height: int, preset: str, codec: str) -> str:
         size_line += f"  (≈ final <code>{human_size(st.est_final_size)}</code>)"
     lines.append(size_line)
     return "\n".join(lines)
+
+
+def _mini(pct: float, width: int = 8) -> str:
+    filled = round(width * min(max(pct, 0), 100) / 100)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def render_dist(st, name: str, height: int, preset: str, codec: str) -> str:
+    head = (f"🌐 <b>Distributed Encode</b> → <b>{height}p</b>\n<code>{esc(short_name(name))}</code>\n"
+            f"⚙️ <code>{codec} • {preset} • {st.n_workers} workers</code>\n")
+    if st.phase == "split":
+        return head + "\n✂️ Video එක keyframes අනුව කොටස් වලට කඩනවා…"
+    if st.phase == "upload":
+        return head + f"\n☁️ කොටස් {len(st.parts)} Release එකට upload කරනවා…"
+    if st.phase == "merge":
+        return head + "\n🔗 <b>කොටස් merge කරනවා…</b>"
+    labels = {
+        "waiting": "⏳ runner එකක් බලාගෙන", "uploading": "☁️ result upload",
+        "remote_done": "📥 fetching", "failed": "⚠️ main එකෙන් retry", "ready": "✅ done",
+    }
+    lines = [head, f"<code>[{bar(st.percent)}] {st.percent:5.1f}%</code>",
+             f"🎞 Video: <code>{human_time(st.out_time)} / {human_time(st.duration)}</code>",
+             f"🚀 Speed: <code>{st.speed:.2f}x</code> realtime (මුළු එකතුව) • <code>{st.fps:.0f} fps</code>"]
+    if st.est_total_frames:
+        lines.append(f"🖼 Frames: <code>{st.frame:,} / ≈{st.est_total_frames:,}</code>")
+    lines.append(f"⏳ ETA: <code>{human_time(st.eta)}</code>   ⏱ Elapsed: <code>{human_time(st.elapsed)}</code>")
+    size = f"📦 Output so far: <code>{human_size(st.out_size)}</code>"
+    if st.est_final_size:
+        size += f"  (≈ final <code>{human_size(st.est_final_size)}</code>)"
+    lines += [size, "", "<b>Workers</b>"]
+    for p in st.parts:
+        if p.status == "running":
+            txt = f"{_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
+        elif p.status == "local":
+            txt = f"🏠 {_mini(p.pct)} {p.pct:3.0f}% • {p.speed:.1f}x"
+        else:
+            txt = labels.get(p.status, p.status)
+        lines.append(f"<code>{p.idx + 1}</code> {txt}")
+    return "\n".join(lines)
